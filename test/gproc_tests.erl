@@ -154,6 +154,8 @@ reg_test_() ->
       , ?_test(t_is_clean())
       , {spawn, ?_test(?debugVal(t_get_env_inherit()))}
       , ?_test(t_is_clean())
+      , {spawn, ?_test(?debugVal(t_monitor_mfa()))}
+      , ?_test(t_is_clean())
       , {spawn, ?_test(?debugVal(t_monitor()))}
       , ?_test(t_is_clean())
       , {spawn, ?_test(?debugVal(t_monitor_give_away()))}
@@ -933,6 +935,23 @@ t_monitor() ->
     receive
 	M ->
 	    ?assertEqual({gproc,unreg,Ref,{n,l,a}}, M)
+    end.
+
+t_monitor_mfa() ->
+    Me = self(),
+    P = spawn_link(fun() ->
+                           gproc:reg({n,l,a}),
+                           Me ! continue,
+                           t_loop()
+                   end),
+    receive continue ->
+            ok
+    end,
+    _ = gproc:monitor(P, erlang, send, [custom_msg]),
+    ?assertEqual(ok, t_lcall(P, die)),
+    receive
+        M ->
+            ?assertEqual(custom_msg, M)
     end.
 
 t_monitor_give_away() ->

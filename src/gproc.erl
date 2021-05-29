@@ -67,7 +67,7 @@
          nb_wait/1, nb_wait/2,
          cancel_wait/2, cancel_wait/3,
 	 cancel_wait_or_monitor/1,
-	 monitor/1, monitor/2,
+	 monitor/1, monitor/2, monitor/4,
 	 demonitor/2,
          lookup_pid/1,
          lookup_pids/1,
@@ -953,10 +953,12 @@ monitor(Key) ->
 %% monitor types, but `{gproc, registered, Ref, Key}' is also sent when a new
 %% process registers the name.
 %% @end
+
 monitor(Key, Type) when Type==info;
                         Type==follow;
                         Type==standby ->
     ?CATCH_GPROC_ERROR(monitor1(Key, Type), [Key, Type]).
+
 
 monitor1({T,g,_} = Key, Type) when T==n; T==a; T==rc ->
     ?CHK_DIST,
@@ -965,6 +967,17 @@ monitor1({T,l,_} = Key, Type) when T==n; T==a; T==rc ->
     call({monitor, Key, self(), Type}, l);
 monitor1(_, _) ->
     ?THROW_GPROC_ERROR(badarg).
+
+%% @spec monitor(key(), module(), function(), arguments()) -> reference()
+%%
+%% @doc monitor a Pid, execute a callback
+%% `monitor(Pid, M, F, A)' works much like erlang:monitor(process, Pid).
+%% When Pid dies, groc will erlang:apply(M, F, A).
+%% @end
+
+monitor(Pid, Module, Function, Args) when is_pid(Pid),
+                                          is_list(Args) ->
+    call({monitor, Pid, Module, Function, Args}, l).
 
 %% @spec demonitor(key(), reference()) -> ok
 %%
@@ -2379,6 +2392,23 @@ handle_call({reg_or_locate, {T,l,_} = Key, Val, P}, _, S) ->
 	[{_, OtherPid, OtherValue}] ->
 	    {reply, {OtherPid, OtherValue}, S}
     end;
+handle_call({monitor, Pid, Module, Function, Args}, _From, S) ->
+    Key = {Pid, monitor_apply},
+    case is_process_alive(Pid) of
+        true ->
+            Lookup = ets:lookup(?TAB, Key),
+            NewMfa = {Module, Function, Args},
+            NewFuns =
+                case Lookup of
+                    [] -> [NewMfa];
+                    [{Key, Values}] -> [NewMfa | Values]
+                end,
+            ets:insert(?TAB, {Key, lists:usort(NewFuns) }),
+            {reply, ok, S};
+        false ->
+            Res = {error, process_is_dead},
+            {reply, Res, S}
+    end;
 handle_call({monitor, {T,l,_} = Key, Pid, Type}, _From, S)
   when T==n; T==a; T==rc ->
     Ref = make_ref(),
@@ -2541,6 +2571,7 @@ handle_call(_, _, S) ->
 
 %% @hidden
 handle_info({'DOWN', _MRef, process, Pid, _}, S) ->
+    _ = maybe_monitor(Pid),
     _ = process_is_down(Pid),
     {noreply, S};
 handle_info(_, S) ->
@@ -2673,6 +2704,28 @@ audit_process(Pid) when is_pid(Pid) ->
 nb_audit_process(Pid) when is_pid(Pid) ->
     ok = gen_server:cast(gproc, {audit_process, Pid}).
 
+-spec maybe_monitor(pid()) -> ok.
+
+maybe_monitor(Pid) when is_pid(Pid) ->
+    Key = {Pid, monitor_apply},
+    MS = [{{{Pid,{'_','_','$2'}},'_'},[],['$2']}],
+    case ets:lookup(?TAB, Key) of
+        [] ->
+            ok;
+        [{Key, Values}] ->
+            Revs = ets:select(?TAB, MS),
+            lists:foreach(fun({Mod, Fun, Args}) ->
+                                  Info = [Pid, Revs],
+                                  try
+                                      erlang:apply(Mod, Fun, Info++Args)
+                                  catch _:_ ->
+                                          ok
+                                  end
+                             end, Values),
+            ets:delete(?TAB, Key),
+            ok
+    end.
+
 -spec process_is_down(pid()) -> ok.
 
 process_is_down(Pid) when is_pid(Pid) ->
@@ -2686,49 +2739,7 @@ process_is_down(Pid) when is_pid(Pid) ->
             Revs = ets:select(?TAB, [{{{Pid,'$1'}, '$2'},
                                       [{'==',{element,2,'$1'},l}],
 				      [{{'$1','$2'}}]}]),
-            lists:foreach(
-              fun({{n,l,_}=K, R}) ->
-                      Key = {K,n},
-                      case ets:lookup(?TAB, Key) of
-                          [{_, Pid, V}] ->
-                              ets:delete(?TAB, Key),
-			      opt_notify(R, K, Pid, V);
-                          [{_, Waiters}] ->
-                              case [W || W <- Waiters,
-                                         element(1,W) =/= Pid] of
-                                  [] ->
-                                      ets:delete(?TAB, Key);
-                                  Waiters1 ->
-                                      ets:insert(?TAB, {Key, Waiters1})
-                              end;
-                          [{_, OtherPid, _}] when Pid =/= OtherPid ->
-                              case ets:lookup(?TAB, {OtherPid, K}) of
-                                  [{RK, Opts}] when is_list(Opts) ->
-                                      Opts1 = gproc_lib:remove_monitor_pid(
-                                                Opts, Pid),
-                                      ets:insert(?TAB, {RK, Opts1});
-                                  _ ->
-                                      true
-                              end;
-                          [] ->
-                              true
-                      end;
-                 ({{c,l,C} = K, _}) ->
-                      Key = {K, Pid},
-                      [{_, _, Value}] = ets:lookup(?TAB, Key),
-                      ets:delete(?TAB, Key),
-                      gproc_lib:update_aggr_counter(l, C, -Value);
-                 ({{r,l,Rsrc} = K, _}) ->
-                      Key = {K, Pid},
-                      ets:delete(?TAB, Key),
-                      gproc_lib:decrement_resource_count(l, Rsrc);
-                 ({{rc,l,_} = K, R}) ->
-                      remove_aggregate(rc, K, R, Pid);
-                 ({{a,l,_} = K, R}) ->
-                      remove_aggregate(a, K, R, Pid);
-                 ({{p,_,_} = K, _}) ->
-                      ets:delete(?TAB, {K, Pid})
-              end, Revs),
+            _ = [ do_process_is_down(R, Pid) || R <- Revs ],
             ets:select_delete(?TAB, [{{{Pid,{'_',l,'_'}},'_'}, [], [true]}]),
             ets:delete(?TAB, Marker),
             ok
@@ -2751,6 +2762,48 @@ remove_aggregate(T, K, R, Pid) ->
         [] ->
             opt_notify(R, K, Pid, undefined)
     end.
+
+do_process_is_down({{n,l,_}=K, R}, Pid) ->
+    Key = {K,n},
+    case ets:lookup(?TAB, Key) of
+        [{_, Pid, V}] ->
+            ets:delete(?TAB, Key),
+			      opt_notify(R, K, Pid, V);
+        [{_, Waiters}] ->
+            case [W || W <- Waiters,
+                       element(1,W) =/= Pid] of
+                [] ->
+                    ets:delete(?TAB, Key);
+                Waiters1 ->
+                    ets:insert(?TAB, {Key, Waiters1})
+            end;
+        [{_, OtherPid, _}] when Pid =/= OtherPid ->
+            case ets:lookup(?TAB, {OtherPid, K}) of
+                [{RK, Opts}] when is_list(Opts) ->
+                    Opts1 = gproc_lib:remove_monitor_pid(
+                              Opts, Pid),
+                    ets:insert(?TAB, {RK, Opts1});
+                _ ->
+                    true
+            end;
+        [] ->
+            true
+    end;
+do_process_is_down({{c,l,C} = K, _}, Pid) ->
+    Key = {K, Pid},
+    [{_, _, Value}] = ets:lookup(?TAB, Key),
+    ets:delete(?TAB, Key),
+    gproc_lib:update_aggr_counter(l, C, -Value);
+do_process_is_down({{r,l,Rsrc} = K, _}, Pid) ->
+    Key = {K, Pid},
+    ets:delete(?TAB, Key),
+    gproc_lib:decrement_resource_count(l, Rsrc);
+do_process_is_down({{rc,l,_} = K, R}, Pid) ->
+    remove_aggregate(rc, K, R, Pid);
+do_process_is_down({{a,l,_} = K, R}, Pid) ->
+    remove_aggregate(a, K, R, Pid);
+do_process_is_down({{p,_,_} = K, _}, Pid) ->
+    ets:delete(?TAB, {K, Pid}).
 
 opt_notify(r, _, _, _) ->
     ok;
